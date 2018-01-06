@@ -2,6 +2,7 @@
 
 #include <time.h>
 #include <assert.h>
+#include <stdio.h>
 
 #include "skinny_mutex.h"
 
@@ -20,13 +21,19 @@ static void test_lock_unlock(skinny_mutex_t *mutex)
 	assert(!skinny_mutex_unlock(mutex));
 }
 
-/* Wait a millisecond */
-static void delay(void)
+/* Wait a number of microseconds */
+static void delay_us(int us)
 {
 	struct timespec ts;
 	ts.tv_sec = 0;
-	ts.tv_nsec = 1000000;
+	ts.tv_nsec = 1000 * us;
 	assert(!nanosleep(&ts, NULL));
+}
+
+/* Wait 1 millisecond */
+static void delay()
+{
+    delay_us(1000);
 }
 
 struct test_contention {
@@ -197,11 +204,32 @@ static void test_cond_timedwait(skinny_mutex_t *mutex)
 	assert(!pthread_cond_destroy(&cond));
 }
 
+struct maniac_loop {
+	skinny_mutex_t *mutex;
+    int loop;
+    int cancelled;
+};
+
+static void *maniac_loop(void *v_ml)
+{
+	struct maniac_loop *ml = v_ml;
+
+    while(!*(volatile int*)&ml->cancelled)
+    {
+        assert(!skinny_mutex_lock(ml->mutex));
+        assert(!skinny_mutex_unlock(ml->mutex));
+    }
+
+    return NULL;
+}
+
 static void test_cond_wait_cancellation(skinny_mutex_t *mutex)
 {
 	struct test_cond_wait tcw;
+	struct maniac_loop ml;
 	pthread_t thread;
 	void *retval;
+    int i;
 
 	tcw.mutex = mutex;
 	assert(!pthread_cond_init(&tcw.cond, NULL));
@@ -209,10 +237,22 @@ static void test_cond_wait_cancellation(skinny_mutex_t *mutex)
 
 	assert(!pthread_create(&thread, NULL, test_cond_wait_thread, &tcw));
 
-	delay();
+    ml.mutex = mutex;
+    ml.cancelled = 0;
+	pthread_t threads[10];
+    printf("test_cond_wait_cancellation: spawn lock/unlock madness...\n");
+	for (i = 0; i < 10; i++)
+		assert(!pthread_create(&threads[i], NULL, maniac_loop, &ml));
+
+	delay_us(300 * 1000);
+    printf("test_cond_wait_cancellation: cancel thread...\n");
 	assert(!pthread_cancel(thread));
 	assert(!pthread_join(thread, &retval));
 	assert(retval == PTHREAD_CANCELED);
+
+    ml.cancelled = 1;
+	for (i = 0; i < 10; i++)
+		assert(!pthread_join(threads[i], NULL));
 
 	assert(!pthread_cond_destroy(&tcw.cond));
 }

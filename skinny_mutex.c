@@ -143,6 +143,10 @@ struct fat_mutex {
 	/* Conv var signalled when the mutex is released and there are
 	   waiters. */
 	pthread_cond_t held_cond;
+
+    /* Cache skinny in fat, for wait cancellation,
+       convenience, at the cost of more space for fat_mutex, so maybe a better solution. */
+    skinny_mutex_t* skinny;
 };
 
 /*
@@ -390,6 +394,7 @@ static int skinny_mutex_promote(skinny_mutex_t *skinny, void *head,
 	   for the pseudo-reference from the holding thread. */
 	fat->refcount = fat->held;
 	fat->waiters = 0;
+    fat->skinny = skinny;
 
 	res = pthread_mutex_init(&fat->mutex, NULL);
 	if (res)
@@ -447,7 +452,13 @@ static int fat_mutex_release(skinny_mutex_t *skinny, struct fat_mutex *fat)
 {
 	int keep, res;
 
-	assert(!fat->held);
+    /*
+       Can happen from cond_wait_cleanup on cancellation.
+       Another thread could have fat_mutex_lock'd successfully just
+       before the cancellation re-acquires fat->mutex to then call
+       cond_wait_cleanup -> fat_mutex_release ?
+       assert(!fat->held);
+    */
 
 	/* If the decremented refcount reaches zero, then we know
 	   there are no secondary peg chains or other threads pinning
@@ -456,6 +467,8 @@ static int fat_mutex_release(skinny_mutex_t *skinny, struct fat_mutex *fat)
 	   primary chain either.  So if the CAS succeeds in nulling
 	   out the skinny_mutex, we can free the fat_mutex. */
 	keep = (--fat->refcount || !strict_cas(&skinny->val, fat, NULL));
+
+    assert(keep || !fat->held);
 
 	res = pthread_mutex_unlock(&fat->mutex);
 	if (keep || res)
@@ -621,16 +634,34 @@ int skinny_mutex_unlock_slow(skinny_mutex_t *skinny)
 	return recover(res, fat_mutex_release(skinny, fat));
 }
 
-/* Thread cancallation cleanup handler when waiting for the condition
+/* Thread cancellation cleanup handler when waiting for the condition
    variable below. */
-static void cond_wait_cleanup(void *v_skinny)
+static void cond_wait_cleanup(void *v_fat)
 {
-	skinny_mutex_t *skinny = v_skinny;
+    /* This is incorrect: Another thread may have pegged, attempted to get fat->held,
+       failed (because another thread beat it), released fat->mutex in the
+       loop in fat_mutex_lock (to wait for a signal to retry held) ...
+       just before pthread_cond_wait re-acquires fat->mutex for cancellation? */
+
+    /*
+      skinny_mutex_t *skinny = v_skinny;
+    */
 
 	/* Cancellation of pthread_cond_wait re-acquires fat->mutex,
 	 * and we have it pinned, so we can access the fat mutex
 	 * directly from the skinny mutex for once. */
-	assert(!fat_mutex_release(skinny, skinny->val));
+
+	/*
+      assert(!fat_mutex_release(skinny, skinny->val));
+    */
+
+    /* This is more robust */
+	struct fat_mutex *fat = (struct fat_mutex*)v_fat;
+	skinny_mutex_t *skinny = fat->skinny;
+    /* this will assert, as skinny->val is not necessarily fat here */
+    /* assert(fat == skinny->val); */
+
+	assert(!fat_mutex_release(skinny, fat));
 }
 
 int skinny_mutex_cond_timedwait(pthread_cond_t *cond, skinny_mutex_t *skinny,
@@ -650,13 +681,16 @@ int skinny_mutex_cond_timedwait(pthread_cond_t *cond, skinny_mutex_t *skinny,
 		}
 	}
 
-       /* Relinquish the mutex.  But we leave our reference accounted
-          for in fat->refcount in place, in order to pin the
-          fat_mutex. */
+    /* Relinquish the mutex.  But we leave our reference accounted
+       for in fat->refcount in place, in order to pin the
+       fat_mutex. */
 	fat->held = 0;
 
 	/* pthread_cond_wait is a cancellation point */
+    /*
 	pthread_cleanup_push(cond_wait_cleanup, skinny);
+    */
+	pthread_cleanup_push(cond_wait_cleanup, fat);
 
 	if (!abstime)
 		res = pthread_cond_wait(cond, &fat->mutex);
